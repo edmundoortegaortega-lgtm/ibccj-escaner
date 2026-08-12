@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#073766">
+  <title>Escáner QR | IBCCJ</title>
+  <style>
+    :root{--navy:#073766;--blue:#0d65b5;--cyan:#1497d1;--gold:#d6a62c;--ok:#137a50;--bad:#b42318;--paper:#fff;--bg:#edf5fb;--ink:#172033;--muted:#667085}
+    *{box-sizing:border-box}
+    html,body{margin:0;width:100%;min-height:100%;background:var(--bg);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:var(--ink)}
+    body{min-height:100dvh;overflow-x:hidden}
+    .app{min-height:100dvh;display:flex;flex-direction:column}
+    header{padding:calc(14px + env(safe-area-inset-top)) 16px 14px;background:linear-gradient(120deg,#062e5d,var(--blue));color:#fff;box-shadow:0 8px 24px rgba(7,55,102,.2)}
+    header h1{margin:0;font-size:20px} header p{margin:5px 0 0;color:#cfe4f8;font-size:12px;font-weight:700}
+    main{width:min(680px,100%);margin:0 auto;padding:14px 14px calc(18px + env(safe-area-inset-bottom));display:grid;gap:12px;flex:1}
+    .card{background:#fff;border:1px solid #d8e5ef;border-radius:18px;box-shadow:0 12px 30px rgba(7,55,102,.1);overflow:hidden}
+    .meta{padding:12px 14px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+    .meta strong{color:var(--navy)} .meta span{font-size:12px;color:var(--muted);font-weight:800}
+    .stage{position:relative;width:100%;height:min(62dvh,560px);min-height:340px;background:#071c31;overflow:hidden}
+    video{display:block;width:100%;height:100%;object-fit:cover;background:#071c31}
+    .frame{position:absolute;left:50%;top:50%;width:min(72vw,290px);aspect-ratio:1;transform:translate(-50%,-50%);border:4px solid var(--gold);border-radius:24px;box-shadow:0 0 0 999px rgba(0,15,30,.34);pointer-events:none}
+    .frame:after{content:"";position:absolute;left:14%;right:14%;top:50%;height:2px;background:#fff;box-shadow:0 0 10px rgba(255,255,255,.8)}
+    .status{padding:12px 14px;border-radius:14px;font-size:13px;font-weight:800;line-height:1.4;background:#eaf4fc;color:#0a4d82}
+    .status.ok{background:#e8f7ef;color:var(--ok)} .status.bad{background:#fdecea;color:var(--bad)} .status.warn{background:#fff6d8;color:#765600}
+    .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    button{min-height:50px;border:0;border-radius:14px;padding:12px 14px;font:inherit;font-weight:850;cursor:pointer}
+    .primary{color:#fff;background:linear-gradient(135deg,#07529a,#1497d1);box-shadow:0 8px 20px rgba(13,101,181,.22)}
+    .ghost{color:var(--navy);background:#fff;border:1px solid #cbdcea}
+    canvas{display:none}
+    .small{font-size:11px;color:var(--muted);text-align:center;line-height:1.45}
+    @media(max-width:480px){main{padding-left:10px;padding-right:10px}.stage{height:58dvh;min-height:330px}.actions{grid-template-columns:1fr}.frame{width:min(74vw,260px)}}
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Escáner QR · IBCCJ</h1>
+    <p id="courseLabel">Pase de asistencia</p>
+  </header>
+  <main>
+    <section class="card">
+      <div class="meta"><strong>Escaneo continuo</strong><span id="countLabel">0 lecturas aceptadas</span></div>
+      <div class="stage">
+        <video id="video" autoplay muted playsinline></video>
+        <div class="frame" aria-hidden="true"></div>
+      </div>
+    </section>
+    <div id="status" class="status">Preparando cámara…</div>
+    <div class="actions">
+      <button id="startBtn" class="primary" type="button">📷 Iniciar cámara</button>
+      <button id="closeBtn" class="ghost" type="button">Cerrar escáner</button>
+    </div>
+    <div class="small">Mantén esta pantalla abierta. Después de cada registro correcto, presenta inmediatamente el QR del siguiente alumno.</div>
+    <canvas id="canvas"></canvas>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+(() => {
+  'use strict';
+  const params = new URLSearchParams(location.search);
+  const portalOrigin = String(params.get('portalOrigin') || '').trim();
+  const grupo = String(params.get('grupo') || '').trim();
+  const materia = String(params.get('materia') || '').trim();
+  document.getElementById('courseLabel').textContent = [materia, grupo ? 'Grupo ' + grupo : ''].filter(Boolean).join(' · ') || 'Pase de asistencia';
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusBox = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const countLabel = document.getElementById('countLabel');
+  let stream = null;
+  let running = false;
+  let busy = false;
+  let raf = 0;
+  let lastFrame = 0;
+  let lastRaw = '';
+  let lastRawAt = 0;
+  let accepted = 0;
+  let detector = null;
+  let pending = new Map();
+
+  function status(message, kind='') {
+    statusBox.textContent = message;
+    statusBox.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  async function ensureDetector() {
+    if (detector) return detector;
+    if (!('BarcodeDetector' in window)) return null;
+    try {
+      if (BarcodeDetector.getSupportedFormats) {
+        const formats = await BarcodeDetector.getSupportedFormats();
+        if (!formats.includes('qr_code')) return null;
+      }
+      detector = new BarcodeDetector({formats:['qr_code']});
+      return detector;
+    } catch (_) { return null; }
+  }
+
+  async function decode() {
+    if (video.readyState < 2 || !video.videoWidth) return '';
+    const maxW = 720;
+    const scale = Math.min(1, maxW / video.videoWidth);
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    const d = await ensureDetector();
+    if (d) {
+      try {
+        const codes = await d.detect(canvas);
+        if (codes && codes[0] && codes[0].rawValue) return String(codes[0].rawValue);
+      } catch (_) {}
+    }
+    if (typeof window.jsQR === 'function') {
+      try {
+        const img = ctx.getImageData(0,0,canvas.width,canvas.height);
+        const code = window.jsQR(img.data,img.width,img.height,{inversionAttempts:'attemptBoth'});
+        if (code && code.data) return String(code.data);
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  function sendToPortal(raw) {
+    if (!window.opener || window.opener.closed || !portalOrigin) {
+      status('Abre este escáner desde el Portal Académico para poder registrar asistencia.', 'bad');
+      busy = false;
+      return;
+    }
+    const scanId = String(Date.now()) + '-' + Math.random().toString(36).slice(2,8);
+    pending.set(scanId, Date.now());
+    window.opener.postMessage({type:'IBCCJ_QR_SCAN', scanId, raw}, portalOrigin);
+    status('Validando alumno y grupo en el portal…');
+    window.setTimeout(() => {
+      if (!pending.has(scanId)) return;
+      pending.delete(scanId);
+      busy = false;
+      status('El portal no respondió. Regresa al portal y confirma que la sesión siga abierta.', 'warn');
+    }, 12000);
+  }
+
+  async function loop(ts) {
+    if (!running) return;
+    raf = requestAnimationFrame(loop);
+    if (busy || ts - lastFrame < 160) return;
+    lastFrame = ts;
+    const raw = await decode();
+    if (!raw) return;
+    const now = Date.now();
+    if (raw === lastRaw && now - lastRawAt < 2400) return;
+    lastRaw = raw;
+    lastRawAt = now;
+    busy = true;
+    sendToPortal(raw);
+  }
+
+  async function openCamera() {
+    if (running) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      status('Este navegador no permite usar la cámara aquí. Abre el enlace en Safari o Chrome.', 'bad');
+      return;
+    }
+    startBtn.disabled = true;
+    startBtn.textContent = 'Abriendo cámara…';
+    try {
+      const attempts = [
+        {audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}},
+        {audio:false,video:{facingMode:'environment'}},
+        {audio:false,video:true}
+      ];
+      let err = null;
+      for (const c of attempts) {
+        try { stream = await navigator.mediaDevices.getUserMedia(c); break; }
+        catch (e) { err = e; if (String(e.name||'') === 'NotAllowedError') break; }
+      }
+      if (!stream) throw err || new Error('No se pudo abrir la cámara.');
+      video.srcObject = stream;
+      await video.play();
+      await ensureDetector();
+      if (!detector && typeof window.jsQR !== 'function') throw new Error('No se cargó el lector QR.');
+      running = true;
+      startBtn.textContent = 'Cámara activa';
+      status('Cámara activa. Presenta el QR del primer alumno.');
+      raf = requestAnimationFrame(loop);
+    } catch (e) {
+      status(String(e && e.name || '') === 'NotAllowedError' ? 'Permite el acceso a Cámara en Safari/Chrome y vuelve a tocar “Iniciar cámara”.' : (e.message || 'No se pudo abrir la cámara.'), 'bad');
+      startBtn.disabled = false;
+      startBtn.textContent = '📷 Iniciar cámara';
+    }
+  }
+
+  function closeCamera() {
+    running = false;
+    if (raf) cancelAnimationFrame(raf);
+    if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch (_) {} }
+    stream = null;
+    try { window.close(); } catch (_) {}
+  }
+
+  window.addEventListener('message', (event) => {
+    if (!portalOrigin || event.origin !== portalOrigin) return;
+    const data = event.data || {};
+    if (data.type !== 'IBCCJ_QR_RESULT') return;
+    if (data.scanId) pending.delete(data.scanId);
+    if (data.ok) {
+      accepted += data.alreadyRegistered ? 0 : 1;
+      countLabel.textContent = accepted + (accepted === 1 ? ' lectura aceptada' : ' lecturas aceptadas');
+      status(data.message || 'Asistencia registrada. Listo para el siguiente QR.', data.alreadyRegistered ? '' : 'ok');
+      try { if (navigator.vibrate) navigator.vibrate(70); } catch (_) {}
+      setTimeout(() => { busy = false; status('Listo para el siguiente QR.'); }, 700);
+    } else {
+      status(data.message || 'QR rechazado por el portal.', 'bad');
+      try { if (navigator.vibrate) navigator.vibrate([80,50,80]); } catch (_) {}
+      setTimeout(() => { busy = false; }, 1000);
+    }
+  });
+
+  startBtn.addEventListener('click', openCamera);
+  document.getElementById('closeBtn').addEventListener('click', closeCamera);
+  window.addEventListener('pagehide', () => { if (stream) try { stream.getTracks().forEach(t => t.stop()); } catch (_) {} });
+
+  if (!portalOrigin || !/^https:\/\//i.test(portalOrigin)) {
+    status('Abre este escáner desde el Portal Académico.', 'warn');
+  } else {
+    // Intento automático; si el navegador exige toque, el botón queda disponible.
+    openCamera();
+  }
+})();
+</script>
+</body>
+</html>
